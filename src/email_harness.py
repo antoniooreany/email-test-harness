@@ -96,6 +96,10 @@ def create_hotel(client: httpx.Client, api_base: str, email: str) -> Optional[st
         },
     )
     if response.status_code >= 400:
+        print(
+            f"ERROR: POST {url} returned {response.status_code}: {response.text}",
+            file=sys.stderr,
+        )
         return None
     return extract_hotel_id(response.content)
 
@@ -103,7 +107,13 @@ def create_hotel(client: httpx.Client, api_base: str, email: str) -> Optional[st
 def trigger_reminder(client: httpx.Client, api_base: str, hotel_id: str) -> bool:
     url = f"{api_base}/api/hotels/{hotel_id}/force-remind"
     response = client.put(url)
-    return response.status_code == 200
+    if response.status_code != 200:
+        print(
+            f"ERROR: PUT {url} returned {response.status_code}: {response.text}",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def check_queue_status(
