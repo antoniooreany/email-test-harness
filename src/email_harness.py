@@ -121,7 +121,7 @@ def check_queue_status(
 ) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, status, COALESCE(failure_reason, ''), retry_count, attempts "
+            "SELECT id, status, COALESCE(failure_reason, ''), failure_count, attempts "
             "FROM email_queue WHERE hotel_email = %s ORDER BY id DESC",
             (email,),
         )
