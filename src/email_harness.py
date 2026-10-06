@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess as _subprocess
 import sys
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Iterator, Optional, Tuple
 
 import httpx
@@ -146,6 +149,98 @@ def poll_until_terminal(
     return (False, last_reason or "timeout", last_qid, last_attempts, time.monotonic() - start)
 
 
+# ---------- orchestration ----------
+
+
+def check_service_up(url: str, timeout_sec: float = 2.0) -> bool:
+    """Return True if the given URL responds with a status code < 500.
+    Treat any HTTPException or network error as 'down'."""
+    try:
+        with httpx.Client(timeout=timeout_sec) as client:
+            response = client.get(url)
+        return response.status_code < 500
+    except Exception:
+        return False
+
+
+def wait_for_service_ready(
+    url: str,
+    timeout_sec: float = 60.0,
+    sleep_sec: float = 1.0,
+) -> bool:
+    """Poll `check_service_up` until it returns True or `timeout_sec` elapses."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if check_service_up(url, timeout_sec=min(sleep_sec * 2, 5.0)):
+            return True
+        time.sleep(sleep_sec)
+    return False
+
+
+def start_hotel_data_if_needed(
+    hotels_data_dir: str,
+    api_base: str,
+    start_timeout_sec: float = 60.0,
+) -> bool:
+    """If hotels-data is not reachable, run the project's
+    `run-local.ps1` bootstrap (which boots Postgres + Mongo + Kafka via
+    docker compose and the Spring Boot app) and then wait for the API
+    to come up. Returns True on success, False on any failure."""
+    if check_service_up(api_base):
+        return True
+    run_local = Path(hotels_data_dir) / "run-local.ps1"
+    if not run_local.exists():
+        print(
+            f"ERROR: {run_local} not found; cannot start hotels-data",
+            file=sys.stderr,
+        )
+        return False
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if not pwsh:
+        print(
+            "ERROR: neither pwsh nor powershell on PATH; cannot start hotels-data",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"hotels-data not reachable at {api_base}; launching {run_local} via {pwsh}..."
+    )
+    result = _subprocess.run(
+        [pwsh, "-NoProfile", "-File", str(run_local)],
+        cwd=hotels_data_dir,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"run-local.ps1 failed (exit {result.returncode}): "
+            f"{result.stderr.decode(errors='replace')}",
+            file=sys.stderr,
+        )
+        return False
+    return wait_for_service_ready(api_base, timeout_sec=start_timeout_sec)
+
+
+def orchestrate_services(
+    hotels_data_dir: str,
+    api_base: str,
+    db_url: str,
+    start_timeout_sec: float = 60.0,
+) -> bool:
+    """End-to-end bootstrap: start hotels-data if not running, wait for
+    the API, then check the DB is reachable. Returns True on success."""
+    if not start_hotel_data_if_needed(hotels_data_dir, api_base, start_timeout_sec):
+        return False
+    try:
+        with open_db(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return True
+    except Exception as e:
+        print(f"DB not reachable at {db_url}: {e}", file=sys.stderr)
+        return False
+
+
 # ---------- entry point ----------
 
 
@@ -174,6 +269,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hotel-id",
         help="reuse an existing hotel id instead of creating a new one",
+    )
+    parser.add_argument(
+        "--hotels-data-dir",
+        default=str(Path(__file__).resolve().parent.parent.parent / "hotels-data"),
+        help="path to the hotels-data repo (used only when auto-starting services)",
+    )
+    parser.add_argument(
+        "--no-auto-start",
+        action="store_true",
+        help="don't try to start hotels-data / its deps; fail fast if the API is unreachable",
+    )
+    parser.add_argument(
+        "--start-timeout",
+        type=float,
+        default=60.0,
+        help="max seconds to wait for hotels-data to come up (default 60)",
     )
     parser.add_argument(
         "--dry-run",
